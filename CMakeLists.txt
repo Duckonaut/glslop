@@ -19,8 +19,10 @@ link_libraries("-static")
 
 cmake_policy(SET CMP0135 NEW)
 
+add_executable(${EXECUTABLE_NAME})
+
 # use C11 and C++17
-target_compile_features(${EXECUTABLE_NAME} PRIVATE cxx_std_17)
+target_compile_features(${EXECUTABLE_NAME} PRIVATE cxx_std_20)
 
 target_compile_options(${EXECUTABLE_NAME} PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_definitions(${EXECUTABLE_NAME} PUBLIC PROJECT_NAME="${PROJECT_NAME}")
@@ -31,7 +33,6 @@ target_compile_definitions(${EXECUTABLE_NAME} PUBLIC PROJECT_COMMIT_HASH="${GIT_
 include(FetchContent)
 
 set(ENABLE_HLSL OFF CACHE BOOL "")
-set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "")
 
 FetchContent_Declare(
     glslang
@@ -42,8 +43,12 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(glslang)
 
-add_executable(${EXECUTABLE_NAME}
+target_sources(${EXECUTABLE_NAME} PRIVATE
     src/main.cpp
 )
 
-target_link_libraries(${EXECUTABLE_NAME} PRIVATE glslang)
+target_link_libraries(${EXECUTABLE_NAME} PUBLIC
+    glslang::glslang
+    SPIRV
+    glslang::glslang-default-resource-limits
+)

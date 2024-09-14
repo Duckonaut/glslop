@@ -1,3 +1,4 @@
+#include <filesystem>
 #include <glslang/Include/Common.h>
 #include <glslang/Public/ShaderLang.h>
 #include <glslang/Public/ResourceLimits.h>
@@ -122,11 +123,20 @@ class BasicIncluder : public glslang::TShader::Includer {
   public:
     IncludeResult*
     includeLocal(const char* headerName, const char* includerName, size_t) override {
-        std::string headerPath = std::string(includerName) + "/" + headerName;
+        std::filesystem::path lookupBase = std::filesystem::current_path();
+        if (includerName) {
+            lookupBase = std::filesystem::path(includerName).parent_path();
+        }
+
+        std::filesystem::path headerPath = lookupBase / headerName;
+        if (!std::filesystem::exists(headerPath)) {
+            printf("Failed to open include file %ls\n", headerPath.c_str());
+            return nullptr;
+        }
 
         std::ifstream file(headerPath);
         if (!file.is_open()) {
-            printf("Failed to open include file %s\n", headerPath.c_str());
+            printf("Failed to open include file %ls\n", headerPath.c_str());
             return nullptr;
         }
 
@@ -135,23 +145,33 @@ class BasicIncluder : public glslang::TShader::Includer {
             std::istreambuf_iterator<char>()
         );
 
-        return new IncludeResult(
+        char* content = new char[headerSource.size()];
+        memcpy(content, headerSource.c_str(), headerSource.size());
+        size_t length = headerSource.size();
+
+        IncludeResult* result = new IncludeResult(
             headerName,
-            headerSource.c_str(),
-            headerSource.size(),
-            nullptr
+            content,
+            length,
+            content
         );
+
+        return result;
     }
 
     void releaseInclude(IncludeResult* result) override {
+        delete[] static_cast<char*>(result->userData);
         delete result;
     }
 };
 
+static const char* s_defaultShaderPreamble = "#extension GL_GOOGLE_include_directive : enable\n";
+
 static glslang::TProgram*
-CompileShader(const char* shaderSource, const char* fileName, EShLanguage stage) {
+CompileShader(const char* shaderSource, const char*, EShLanguage stage) {
     glslang::TShader* shader = new glslang::TShader(stage);
     shader->setStrings(&shaderSource, 1);
+    shader->setPreamble(s_defaultShaderPreamble);
     shader->setEnvInput(glslang::EShSourceGlsl, stage, glslang::EShClientVulkan, 100);
     shader->setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_2);
     shader->setEnvTarget(glslang::EshTargetSpv, glslang::EShTargetSpv_1_5);
@@ -160,20 +180,24 @@ CompileShader(const char* shaderSource, const char* fileName, EShLanguage stage)
 
     glslang::TShader::Includer* includer = new BasicIncluder;
 
-    printf("Parsing shader %s... ", fileName);
-    shader->parse(resources, 100, false, EShMsgDefault, *includer);
-    printf("%s\n", shader->getInfoLog());
+    if (!shader->parse(resources, 100, false, EShMsgDefault, *includer)) {
+        printf("Failed to parse shader!\n");
+        printf("%s", shader->getInfoLog());
+        return nullptr;
+    }
 
     glslang::TProgram* program = new glslang::TProgram;
     program->addShader(shader);
 
-    printf("Linking shader %s... ", fileName);
-    program->link(EShMsgDefault);
-
-    printf("%s\n", program->getInfoLog());
+    if (!program->link(EShMsgDefault)) {
+        printf("Failed to link shader!\n");
+        printf("%s", program->getInfoLog());
+        return nullptr;
+    }
 
     if (!program->buildReflection()) {
         printf("Failed to build reflection\n");
+        return nullptr;
     }
 
     return program;
@@ -289,7 +313,7 @@ struct HeaderGenerator {
                 }
             }
 
-            outFile << "#define UNIFORM_" << uniformBlockName << " "
+            outFile << "#define SLOT_" << uniformBlockName << " "
                     << uniformBlock.getBinding() << "\n";
         }
 
@@ -321,7 +345,7 @@ struct HeaderGenerator {
                     }
                 }
             }
-            outFile << "#define BUFFER_" << bufferBlockName << " " << bufferBlock.getBinding()
+            outFile << "#define SLOT_" << bufferBlockName << " " << bufferBlock.getBinding()
                     << "\n";
         }
 
@@ -329,7 +353,13 @@ struct HeaderGenerator {
         for (int i = 0; i < program->getNumPipeInputs(); i++) {
             const glslang::TObjectReflection& input = program->getPipeInput(i);
 
-            outFile << "#define SLOT_" << input.name << " " << input.layoutLocation() << "\n";
+            outFile << "#define ATTR_" << input.name << " " << input.layoutLocation() << "\n";
+        }
+
+        for (int i = 0; i < program->getNumPipeOutputs(); i++) {
+            const glslang::TObjectReflection& output = program->getPipeOutput(i);
+
+            outFile << "#define ATTR_" << output.name << " " << output.layoutLocation() << "\n";
         }
 
         for (int i = 0; i < program->getNumUniformVariables(); i++) {
@@ -339,7 +369,7 @@ struct HeaderGenerator {
                 continue;
             }
 
-            outFile << "#define UNIFORM_" << uniform.name << " " << uniform.getBinding()
+            outFile << "#define SLOT_" << uniform.name << " " << uniform.getBinding()
                     << "\n";
 
             const glslang::TType& type = *uniform.getType();
@@ -548,10 +578,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::string shaderSource(
-        (std::istreambuf_iterator<char>(file)),
-        std::istreambuf_iterator<char>()
-    );
+    std::string shaderSource(std::istreambuf_iterator<char>(file), {});
 
     glslang::TProgram* program =
         CompileShader(shaderSource.c_str(), args.inputFile.c_str(), args.stage);

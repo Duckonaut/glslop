@@ -15,6 +15,10 @@ project(glslop VERSION 0.1.0 LANGUAGES CXX)
 set(EXECUTABLE_NAME ${PROJECT_NAME})
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(BUILD_SHARED_LIBS OFF)
+set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "")
+set(ENABLE_SPVREMAPPER OFF CACHE BOOL "")
+set(ENABLE_HLSL OFF CACHE BOOL "")
+
 link_libraries("-static")
 
 cmake_policy(SET CMP0135 NEW)
@@ -37,7 +41,7 @@ set(ENABLE_HLSL OFF CACHE BOOL "")
 FetchContent_Declare(
     glslang
     GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git
-    GIT_TAG main
+    GIT_TAG 14.3.0
     GIT_SHALLOW TRUE
     GIT_PROGRESS TRUE
 )

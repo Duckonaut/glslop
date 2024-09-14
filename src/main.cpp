@@ -14,12 +14,16 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <unordered_map>
 
 struct Args {
     std::string inputFile;
     std::string outputFile;
     std::optional<std::string> structPrefix;
     std::optional<std::string> globalPrefix;
+
+    std::string extraPrelude;
+    std::unordered_map<std::string, std::string> customTypeMap;
     EShLanguage stage;
 
     static EShLanguage guessStageFromFileName(const std::string& fileName) {
@@ -42,14 +46,14 @@ struct Args {
         for (int i = 1; i < argc; i++) {
             std::string_view arg = argv[i];
 
-            if (arg == "-o") {
+            if (arg == "-o" || arg == "--output") {
                 if (i + 1 < argc) {
                     outputFile = argv[++i];
                 } else {
                     printf("No output file specified\n");
                     exit(1);
                 }
-            } else if (arg == "-s") {
+            } else if (arg == "-s" || arg == "--stage") {
                 if (i + 1 < argc) {
                     std::string_view stageStr = argv[++i];
                     if (stageStr == "vert" || stageStr == "vertex") {
@@ -66,20 +70,69 @@ struct Args {
                     printf("No stage specified\n");
                     exit(1);
                 }
-            } else if (arg == "-p") {
+            } else if (arg == "-p" || arg == "--prefix") {
                 if (i + 1 < argc) {
                     structPrefix = argv[++i];
                 } else {
                     printf("No struct prefix specified\n");
                     exit(1);
                 }
-            } else if (arg == "-g") {
+            } else if (arg == "-g" || arg == "--global-prefix") {
                 if (i + 1 < argc) {
                     globalPrefix = argv[++i];
                 } else {
                     printf("No global prefix specified\n");
                     exit(1);
                 }
+            } else if (arg == "-m" || arg == "--map") {
+                if (i + 1 < argc) {
+                    std::string_view typeMap = argv[++i];
+                    size_t equals = typeMap.find('=');
+                    if (equals == std::string::npos) {
+                        printf("Invalid type map %s\n", typeMap.data());
+                        exit(1);
+                    }
+
+                    std::string_view key = typeMap.substr(0, equals);
+                    std::string_view value = typeMap.substr(equals + 1);
+
+                    customTypeMap[std::string(key)] = std::string(value);
+                } else {
+                    printf("No type map specified\n");
+                    exit(1);
+                }
+            } else if (arg == "-P" || arg == "--prelude") {
+                if (i + 1 < argc) {
+                    std::string extraPreludeFile = argv[++i];
+                    std::ifstream file(extraPreludeFile);
+                    if (!file.is_open()) {
+                        printf(
+                            "Failed to open extra prelude file %s\n",
+                            extraPreludeFile.data()
+                        );
+                        exit(1);
+                    }
+
+                    extraPrelude = std::string(
+                        (std::istreambuf_iterator<char>(file)),
+                        std::istreambuf_iterator<char>()
+                    );
+                } else {
+                    printf("No extra prelude file specified\n");
+                    exit(1);
+                }
+            } else if (arg == "-h" || arg == "--help") {
+                printf("Usage: %s [options] <input file>\n", argv[0]);
+                printf("Options:\n");
+                printf("  -o, --output <file>      Output file\n");
+                printf("  -s, --stage <stage>      Shader stage (vert, frag, comp)\n");
+                printf("  -p, --prefix <prefix>    Struct prefix\n");
+                printf("  -g, --global-prefix <prefix> Global prefix\n");
+                printf("  -m, --map <key>=<value>  Custom type map\n");
+                printf("  -P, --prelude <file>     Extra prelude file\n");
+                printf("  -h, --help               Show this help message\n");
+
+                exit(0);
             } else {
                 inputFile = arg;
             }
@@ -118,14 +171,17 @@ struct Args {
         }
     }
 };
+static std::string g_FirstPath;
 
 class BasicIncluder : public glslang::TShader::Includer {
   public:
     IncludeResult*
     includeLocal(const char* headerName, const char* includerName, size_t) override {
         std::filesystem::path lookupBase = std::filesystem::current_path();
-        if (includerName) {
+        if (includerName && includerName[0] != '\0') {
             lookupBase = std::filesystem::path(includerName).parent_path();
+        } else {
+            lookupBase = std::filesystem::path(g_FirstPath).parent_path();
         }
 
         std::filesystem::path headerPath = lookupBase / headerName;
@@ -149,12 +205,7 @@ class BasicIncluder : public glslang::TShader::Includer {
         memcpy(content, headerSource.c_str(), headerSource.size());
         size_t length = headerSource.size();
 
-        IncludeResult* result = new IncludeResult(
-            headerName,
-            content,
-            length,
-            content
-        );
+        IncludeResult* result = new IncludeResult(headerName, content, length, content);
 
         return result;
     }
@@ -165,7 +216,8 @@ class BasicIncluder : public glslang::TShader::Includer {
     }
 };
 
-static const char* s_defaultShaderPreamble = "#extension GL_GOOGLE_include_directive : enable\n";
+static const char* s_defaultShaderPreamble =
+    "#extension GL_GOOGLE_include_directive : enable\n";
 
 static glslang::TProgram*
 CompileShader(const char* shaderSource, const char*, EShLanguage stage) {
@@ -222,6 +274,8 @@ struct HeaderGenerator {
     std::string structPrefix;
     std::string globalPrefix;
     std::string shaderName;
+    std::unordered_map<std::string, std::string> customTypeMap;
+    std::string extraPrelude;
     EShLanguage stage;
 
     HeaderGenerator(glslang::TProgram* program, const Args& args) : program(program) {
@@ -238,18 +292,27 @@ struct HeaderGenerator {
         }
 
         size_t lastSlash = args.inputFile.find_last_of("/\\");
-        size_t lastDot = args.inputFile.find_last_of(".");
-        if (lastDot == std::string::npos) {
-            lastDot = args.inputFile.size();
+
+        shaderName = args.inputFile.substr(lastSlash + 1, args.inputFile.size() - lastSlash - 1);
+        for (size_t i = 0; i < shaderName.size(); i++) {
+            if (shaderName[i] == '.' || shaderName[i] == '-') {
+                shaderName[i] = '_';
+                break;
+            }
         }
 
-        shaderName = args.inputFile.substr(lastSlash + 1, lastDot - lastSlash - 1);
+        customTypeMap = args.customTypeMap;
+        extraPrelude = args.extraPrelude;
 
         stage = args.stage;
     }
 
     void generate(std::ofstream& outFile) {
         outFile << s_shaderHeaderPrelude;
+
+        if (!extraPrelude.empty()) {
+            outFile << extraPrelude;
+        }
 
         outFile << "static const uint32_t " << globalPrefix << shaderName << "_spv[] = {\n";
 
@@ -313,7 +376,7 @@ struct HeaderGenerator {
                 }
             }
 
-            outFile << "#define SLOT_" << uniformBlockName << " "
+            outFile << "#define SLOT_" << shaderName << "_" << uniformBlockName << " "
                     << uniformBlock.getBinding() << "\n";
         }
 
@@ -345,21 +408,23 @@ struct HeaderGenerator {
                     }
                 }
             }
-            outFile << "#define SLOT_" << bufferBlockName << " " << bufferBlock.getBinding()
-                    << "\n";
+            outFile << "#define SLOT_" << shaderName << "_" << bufferBlockName << " "
+                    << bufferBlock.getBinding() << "\n";
         }
 
         // Generate location and binding defines
         for (int i = 0; i < program->getNumPipeInputs(); i++) {
             const glslang::TObjectReflection& input = program->getPipeInput(i);
 
-            outFile << "#define ATTR_" << input.name << " " << input.layoutLocation() << "\n";
+            outFile << "#define ATTR_" << shaderName << "_" << input.name << " "
+                    << input.layoutLocation() << "\n";
         }
 
         for (int i = 0; i < program->getNumPipeOutputs(); i++) {
             const glslang::TObjectReflection& output = program->getPipeOutput(i);
 
-            outFile << "#define ATTR_" << output.name << " " << output.layoutLocation() << "\n";
+            outFile << "#define ATTR_" << shaderName << "_" << output.name << " "
+                    << output.layoutLocation() << "\n";
         }
 
         for (int i = 0; i < program->getNumUniformVariables(); i++) {
@@ -369,8 +434,8 @@ struct HeaderGenerator {
                 continue;
             }
 
-            outFile << "#define SLOT_" << uniform.name << " " << uniform.getBinding()
-                    << "\n";
+            outFile << "#define SLOT_" << shaderName << "_" << uniform.name << " "
+                    << uniform.getBinding() << "\n";
 
             const glslang::TType& type = *uniform.getType();
 
@@ -380,8 +445,8 @@ struct HeaderGenerator {
         }
 
         for (auto& [uniformBlockName, uniformBlock] : structsEncountered) {
-            outFile << "typedef struct " << structPrefix << uniformBlockName << " "
-                    << structPrefix << uniformBlockName << ";\n";
+            outFile << "typedef struct " << structPrefix << shaderName << "_"
+                    << uniformBlockName << " " << structPrefix << uniformBlockName << ";\n";
         }
 
         for (auto& [uniformBlockName, uniformBlock] : structsEncountered) {
@@ -389,6 +454,58 @@ struct HeaderGenerator {
         }
 
         outFile << s_shaderHeaderPostlude;
+    }
+
+    std::string getTypeGlslName(const glslang::TType& type) {
+        std::string typeName;
+        if (type.getBasicType() == glslang::EbtStruct) {
+            typeName = type.getTypeName().c_str();
+            return typeName;
+        }
+        switch (type.getBasicType()) {
+            case glslang::EbtFloat:
+                typeName = "float";
+                break;
+            case glslang::EbtInt:
+                typeName = "int";
+                break;
+            case glslang::EbtUint:
+                typeName = "uint";
+                break;
+            case glslang::EbtBool:
+                typeName = "bool";
+                break;
+            case glslang::EbtStruct:
+                typeName = structPrefix + type.getTypeName().c_str();
+                break;
+            default:
+                return "unknown";
+        }
+
+        if (type.isVector()) {
+            if (typeName == "float") {
+                typeName = "vec";
+            }
+            typeName += std::to_string(type.getVectorSize());
+        } else if (type.isArray()) {
+            if (type.isSizedArray()) {
+                typeName += "[" + std::to_string(type.getOuterArraySize()) + "]";
+            } else {
+                typeName += "[]";
+            }
+        } else if (type.isMatrix()) {
+            if (typeName == "float") {
+                typeName = "mat";
+            }
+            if (type.getMatrixCols() != type.getMatrixRows()) {
+                typeName += std::to_string(type.getMatrixCols()) + "x" +
+                            std::to_string(type.getMatrixRows());
+            } else {
+                typeName += std::to_string(type.getMatrixCols());
+            }
+        }
+
+        return typeName;
     }
 
     int sizeOfType(const glslang::TType& type) {
@@ -522,11 +639,15 @@ struct HeaderGenerator {
 
         structString << "}";
 
-        outFile << "typedef struct " << structPrefix << structName << " " << structString.str()
-                << " " << structPrefix << structName << ";\n";
+        outFile << "typedef struct " << structPrefix << shaderName << "_" << structName << " "
+                << structString.str() << " " << structPrefix << shaderName << "_" << structName
+                << ";\n";
     }
 
     std::string getFieldString(const glslang::TType& type, const std::string& name) {
+        if (customTypeMap.find(getTypeGlslName(type)) != customTypeMap.end()) {
+            return customTypeMap[getTypeGlslName(type)] + " " + name;
+        }
         std::string fieldString;
         switch (type.getBasicType()) {
             case glslang::EbtFloat:
@@ -577,6 +698,8 @@ int main(int argc, char* argv[]) {
         printf("Failed to open file %s\n", args.inputFile.c_str());
         return 1;
     }
+
+    g_FirstPath = args.inputFile;
 
     std::string shaderSource(std::istreambuf_iterator<char>(file), {});
 

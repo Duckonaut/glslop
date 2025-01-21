@@ -225,8 +225,8 @@ CompileShader(const char* shaderSource, const char*, EShLanguage stage) {
     shader->setStrings(&shaderSource, 1);
     shader->setPreamble(s_defaultShaderPreamble);
     shader->setEnvInput(glslang::EShSourceGlsl, stage, glslang::EShClientVulkan, 100);
-    shader->setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_2);
-    shader->setEnvTarget(glslang::EshTargetSpv, glslang::EShTargetSpv_1_5);
+    shader->setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_0);
+    shader->setEnvTarget(glslang::EshTargetSpv, glslang::EShTargetSpv_1_0);
 
     const TBuiltInResource* resources = GetDefaultResources();
 
@@ -247,7 +247,7 @@ CompileShader(const char* shaderSource, const char*, EShLanguage stage) {
         return nullptr;
     }
 
-    if (!program->buildReflection()) {
+    if (!program->buildReflection(EShReflectionDefault | EShReflectionSeparateBuffers)) {
         printf("Failed to build reflection\n");
         return nullptr;
     }
@@ -293,7 +293,8 @@ struct HeaderGenerator {
 
         size_t lastSlash = args.inputFile.find_last_of("/\\");
 
-        shaderName = args.inputFile.substr(lastSlash + 1, args.inputFile.size() - lastSlash - 1);
+        shaderName =
+            args.inputFile.substr(lastSlash + 1, args.inputFile.size() - lastSlash - 1);
         for (size_t i = 0; i < shaderName.size(); i++) {
             if (shaderName[i] == '.' || shaderName[i] == '-') {
                 shaderName[i] = '_';
@@ -351,6 +352,11 @@ struct HeaderGenerator {
         std::unordered_set<std::string> handledUniforms;
         std::unordered_map<std::string, const glslang::TType&> structsEncountered;
 
+        uint32_t numUniformBuffers = 0;
+        uint32_t numStorageBuffers = 0;
+        uint32_t numSamplers = 0;
+        uint32_t numStorageImages = 0;
+
         // Gather uniform block info
         for (int i = 0; i < program->getNumUniformBlocks(); i++) {
             const glslang::TObjectReflection& uniformBlock = program->getUniformBlock(i);
@@ -378,6 +384,8 @@ struct HeaderGenerator {
 
             outFile << "#define SLOT_" << shaderName << "_" << uniformBlockName << " "
                     << uniformBlock.getBinding() << "\n";
+
+            numUniformBuffers++;
         }
 
         // Gather buffer block info
@@ -410,6 +418,8 @@ struct HeaderGenerator {
             }
             outFile << "#define SLOT_" << shaderName << "_" << bufferBlockName << " "
                     << bufferBlock.getBinding() << "\n";
+
+            numStorageBuffers++;
         }
 
         // Generate location and binding defines
@@ -441,12 +451,28 @@ struct HeaderGenerator {
 
             if (type.getBasicType() == glslang::EbtStruct) {
                 structsEncountered.insert({ uniform.name, type });
+            } else if (type.isImage()) {
+                numStorageImages++;
+            } else if (type.isTexture()) {
+                numSamplers++;
             }
         }
 
+        outFile << "#define NUM_" << shaderName << "_UNIFORM_BUFFERS " << numUniformBuffers
+                << "\n";
+
+        outFile << "#define NUM_" << shaderName << "_STORAGE_BUFFERS " << numStorageBuffers
+                << "\n";
+
+        outFile << "#define NUM_" << shaderName << "_SAMPLERS " << numSamplers << "\n";
+
+        outFile << "#define NUM_" << shaderName << "_STORAGE_IMAGES " << numStorageImages
+                << "\n";
+
         for (auto& [uniformBlockName, uniformBlock] : structsEncountered) {
             outFile << "typedef struct " << structPrefix << shaderName << "_"
-                    << uniformBlockName << " " << structPrefix << uniformBlockName << ";\n";
+                    << uniformBlockName << " " << structPrefix << shaderName << uniformBlockName
+                    << ";\n";
         }
 
         for (auto& [uniformBlockName, uniformBlock] : structsEncountered) {
@@ -645,43 +671,46 @@ struct HeaderGenerator {
     }
 
     std::string getFieldString(const glslang::TType& type, const std::string& name) {
-        if (customTypeMap.find(getTypeGlslName(type)) != customTypeMap.end()) {
-            return customTypeMap[getTypeGlslName(type)] + " " + name;
-        }
         std::string fieldString;
-        switch (type.getBasicType()) {
-            case glslang::EbtFloat:
-                fieldString = "float";
-                break;
-            case glslang::EbtInt:
-                fieldString = "int";
-                break;
-            case glslang::EbtUint:
-                fieldString = "uint";
-                break;
-            case glslang::EbtBool:
-                fieldString = "bool";
-                break;
-            case glslang::EbtStruct:
-                fieldString = structPrefix + type.getTypeName().c_str();
-                break;
-            default:
-                return "unknown";
+        if (customTypeMap.find(getTypeGlslName(type)) != customTypeMap.end()) {
+            fieldString = customTypeMap[getTypeGlslName(type)] + " " + name;
+        } else {
+            switch (type.getBasicType()) {
+                case glslang::EbtFloat:
+                    fieldString = "float";
+                    break;
+                case glslang::EbtInt:
+                    fieldString = "int";
+                    break;
+                case glslang::EbtUint:
+                    fieldString = "uint";
+                    break;
+                case glslang::EbtBool:
+                    fieldString = "bool";
+                    break;
+                case glslang::EbtStruct:
+                    fieldString = structPrefix + type.getTypeName().c_str();
+                    break;
+                default:
+                    return "unknown";
+            }
+
+            if (type.isVector()) {
+                fieldString += " " + name + "[" + std::to_string(type.getVectorSize()) + "]";
+            } else if (type.isMatrix()) {
+                fieldString += " " + name + "[" + std::to_string(type.getMatrixCols()) + "]" +
+                               "[" + std::to_string(type.getMatrixRows()) + "]";
+            } else {
+                fieldString += " " + name;
+            }
         }
 
-        if (type.isVector()) {
-            fieldString += " " + name + "[" + std::to_string(type.getVectorSize()) + "]";
-        } else if (type.isArray()) {
+        if (type.isArray()) {
             if (type.isSizedArray()) {
-                fieldString +=
-                    " " + name + "[" + std::to_string(type.getOuterArraySize()) + "]";
+                fieldString += "[" + std::to_string(type.getOuterArraySize()) + "]";
             } else {
-                fieldString += " " + name + "[]";
+                fieldString += "[]";
             }
-        } else if (type.isMatrix()) {
-            fieldString += " " + name + "[" + std::to_string(type.getMatrixCols()) + "]";
-        } else {
-            fieldString += " " + name;
         }
 
         return fieldString;

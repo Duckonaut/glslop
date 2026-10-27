@@ -689,7 +689,7 @@ struct HeaderGenerator {
                     fieldString = "bool";
                     break;
                 case glslang::EbtStruct:
-                    fieldString = structPrefix + type.getTypeName().c_str();
+                    fieldString = structPrefix + shaderName + "_" + type.getTypeName().c_str();
                     break;
                 default:
                     return "unknown";
